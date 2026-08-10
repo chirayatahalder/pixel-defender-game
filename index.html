@@ -288,9 +288,27 @@
       const H = canvas.height;
       const reducedMotion = window.matchMedia('(prefers-reduced-motion: reduce)').matches;
       const QA_MODE = /^(localhost|127\.0\.0\.1)$/.test(location.hostname) && new URLSearchParams(location.search).has('qa');
+      const QA_SECTOR = QA_MODE ? Math.max(1, Math.min(12, Number(new URLSearchParams(location.search).get('sector')) || 1)) : 1;
+      const LEVEL_DURATION = QA_MODE ? 6 : 18;
 
       const COLORS = {
         cyan: '#54f4ff', violet: '#a979ff', pink: '#ff5c93', gold: '#ffd166', ink: '#f4f7ff', muted: '#8c98ba'
+      };
+
+      const LEVEL_THEMES = [
+        { max: 2, name: 'THE DRIFT', material: 'rock', bg: ['#080d21', '#090d1b', '#0d1020'], grid: '#4c5e9b', star: '#d7deff' },
+        { max: 5, name: 'IRON BELT', material: 'iron', bg: ['#170d16', '#100d18', '#15101b'], grid: '#884d64', star: '#ffd0b2' },
+        { max: 8, name: 'CRYO FIELD', material: 'ice', bg: ['#061523', '#071421', '#07101c'], grid: '#347f9d', star: '#b9f3ff' },
+        { max: 11, name: 'EMBER RIFT', material: 'volcanic', bg: ['#1c090d', '#130a11', '#170b12'], grid: '#944337', star: '#ffc18e' },
+        { max: 12, name: 'VOID CORE', material: 'void', bg: ['#100824', '#090919', '#0d071a'], grid: '#7149ad', star: '#e0c2ff' }
+      ];
+
+      const ASTEROID_MATERIALS = {
+        rock: { label: 'ROCK', light: '#b8bdc9', base: '#71798c', dark: '#282e3d', crater: '#3e4557', rim: '#cad0db', hp: 0, speed: 1, size: 1, points: 1 },
+        iron: { label: 'IRON', light: '#d09a72', base: '#85523f', dark: '#2f2022', crater: '#4a2d2a', rim: '#e1aa7c', hp: 1, speed: .9, size: 1.08, points: 1.6 },
+        ice: { label: 'CRYO', light: '#e1fbff', base: '#62aabe', dark: '#163b55', crater: '#2b6a7f', rim: '#d7fbff', glow: '#58dcff', hp: 0, speed: 1.32, size: .94, points: 1.9 },
+        volcanic: { label: 'MAGMA', light: '#756064', base: '#3b3038', dark: '#140f18', crater: '#22171c', rim: '#a1746a', glow: '#ff5b36', hp: 2, speed: 1.06, size: 1.12, points: 2.5 },
+        void: { label: 'VOID', light: '#b98ee8', base: '#4b356a', dark: '#120d24', crater: '#24163c', rim: '#d4a7ff', glow: '#a979ff', hp: 3, speed: 1.2, size: 1.16, points: 3.4 }
       };
 
       const keys = { left: false, right: false, fire: false };
@@ -307,9 +325,15 @@
       let combo = 0;
       let comboTimer = 0;
       let maxCombo = 0;
+      let levelBanner = 0;
+      let previousLevel = 1;
       let lastTime = performance.now();
       let muted = false;
       let audioContext = null;
+      let masterGain = null;
+      let audioCompressor = null;
+      let musicTimer = null;
+      let musicStep = 0;
 
       const player = { x: W / 2, y: H - 76, w: 42, h: 42, speed: 430, cooldown: 0, invulnerable: 0, tilt: 0, shield: 0, rapid: 0, double: 0 };
       const bullets = [];
@@ -338,9 +362,38 @@
         status.textContent = messages[next] || '';
       }
 
+      function themeForLevel(value = level) {
+        return LEVEL_THEMES.find(theme => value <= theme.max) || LEVEL_THEMES.at(-1);
+      }
+
+      function createAsteroidSurface(radius, material) {
+        const points = 14;
+        return {
+          shape: Array.from({ length: points }, () => .78 + Math.random() * .24),
+          craters: Array.from({ length: 3 + Math.floor(Math.random() * 3) }, () => {
+            const angle = Math.random() * Math.PI * 2;
+            const distance = radius * Math.random() * .48;
+            return {
+              x: Math.cos(angle) * distance,
+              y: Math.sin(angle) * distance,
+              r: radius * (.11 + Math.random() * .12)
+            };
+          }),
+          flecks: Array.from({ length: 9 }, () => ({
+            x: (Math.random() - .5) * radius * 1.25,
+            y: (Math.random() - .5) * radius * 1.25,
+            r: .5 + Math.random() * 1.25,
+            alpha: .12 + Math.random() * .25
+          })),
+          cracks: ['volcanic', 'void'].includes(material)
+            ? Array.from({ length: 3 }, () => ({ angle: Math.random() * Math.PI * 2, length: radius * (.35 + Math.random() * .35) }))
+            : []
+        };
+      }
+
       function resetGame() {
-        score = 0; level = 1; lives = 3; elapsed = 0; spawnTimer = .65; shake = 0; flash = 0;
-        combo = 0; comboTimer = 0; maxCombo = 0; bossLevels.clear();
+        score = 0; level = QA_SECTOR; lives = 3; elapsed = (level - 1) * LEVEL_DURATION + .05; spawnTimer = .65; shake = 0; flash = 0;
+        combo = 0; comboTimer = 0; maxCombo = 0; levelBanner = QA_SECTOR > 1 ? 2.4 : 0; previousLevel = Math.max(1, level - 1); bossLevels.clear();
         bullets.length = 0; enemies.length = 0; enemyBullets.length = 0; powerUps.length = 0; particles.length = 0; floaters.length = 0;
         Object.assign(player, { x: W / 2, cooldown: 0, invulnerable: 0, tilt: 0, shield: 0, rapid: 0, double: 0 });
         if (QA_MODE) {
@@ -352,6 +405,7 @@
         }
         setState('playing');
         sound('start');
+        startMusic();
         publishQASnapshot();
       }
 
@@ -360,31 +414,114 @@
         else if (state === 'paused') { setState(previousState); lastTime = performance.now(); }
       }
 
-      function sound(type) {
-        if (muted) return;
-        try {
-          audioContext ||= new (window.AudioContext || window.webkitAudioContext)();
+      function initAudio() {
+        if (audioContext) {
           if (audioContext.state === 'suspended') audioContext.resume();
-          const now = audioContext.currentTime;
-          const osc = audioContext.createOscillator();
-          const gain = audioContext.createGain();
-          const settings = {
-            shoot: [520, 210, .045, .035, 'square'],
-            hit: [130, 55, .12, .075, 'sawtooth'],
-            explode: [90, 28, .18, .08, 'sawtooth'],
-            start: [240, 620, .22, .06, 'triangle'],
-            level: [440, 880, .3, .06, 'triangle'],
-            pickup: [330, 990, .25, .055, 'sine'],
-            boss: [110, 440, .42, .08, 'sawtooth']
-          }[type] || [220, 110, .1, .04, 'sine'];
-          osc.type = settings[4];
-          osc.frequency.setValueAtTime(settings[0], now);
-          osc.frequency.exponentialRampToValueAtTime(settings[1], now + settings[2]);
-          gain.gain.setValueAtTime(settings[3], now);
-          gain.gain.exponentialRampToValueAtTime(.001, now + settings[2]);
-          osc.connect(gain).connect(audioContext.destination);
-          osc.start(now); osc.stop(now + settings[2]);
-        } catch (_) { /* Audio is an enhancement; the game remains fully playable without it. */ }
+          return true;
+        }
+        try {
+          audioContext = new (window.AudioContext || window.webkitAudioContext)();
+          masterGain = audioContext.createGain();
+          audioCompressor = audioContext.createDynamicsCompressor();
+          audioCompressor.threshold.value = -18;
+          audioCompressor.knee.value = 12;
+          audioCompressor.ratio.value = 5;
+          masterGain.gain.value = muted ? 0 : .72;
+          audioCompressor.connect(masterGain).connect(audioContext.destination);
+          return true;
+        } catch (_) {
+          return false;
+        }
+      }
+
+      function tone(from, to, duration, volume, type = 'sine', delay = 0, pan = 0) {
+        if (!audioContext || !audioCompressor) return;
+        const now = audioContext.currentTime + delay;
+        const oscillator = audioContext.createOscillator();
+        const gain = audioContext.createGain();
+        oscillator.type = type;
+        oscillator.frequency.setValueAtTime(Math.max(20, from), now);
+        oscillator.frequency.exponentialRampToValueAtTime(Math.max(20, to), now + duration);
+        gain.gain.setValueAtTime(.001, now);
+        gain.gain.exponentialRampToValueAtTime(Math.max(.001, volume), now + Math.min(.012, duration * .2));
+        gain.gain.exponentialRampToValueAtTime(.001, now + duration);
+        oscillator.connect(gain);
+        if (audioContext.createStereoPanner) {
+          const panner = audioContext.createStereoPanner();
+          panner.pan.value = pan;
+          gain.connect(panner).connect(audioCompressor);
+        } else {
+          gain.connect(audioCompressor);
+        }
+        oscillator.start(now);
+        oscillator.stop(now + duration + .02);
+      }
+
+      function noise(duration, volume, cutoff = 1000, delay = 0) {
+        if (!audioContext || !audioCompressor) return;
+        const now = audioContext.currentTime + delay;
+        const buffer = audioContext.createBuffer(1, Math.ceil(audioContext.sampleRate * duration), audioContext.sampleRate);
+        const data = buffer.getChannelData(0);
+        for (let i = 0; i < data.length; i++) data[i] = Math.random() * 2 - 1;
+        const source = audioContext.createBufferSource();
+        const filter = audioContext.createBiquadFilter();
+        const gain = audioContext.createGain();
+        source.buffer = buffer;
+        filter.type = 'lowpass';
+        filter.frequency.setValueAtTime(cutoff, now);
+        filter.frequency.exponentialRampToValueAtTime(Math.max(80, cutoff * .22), now + duration);
+        gain.gain.setValueAtTime(volume, now);
+        gain.gain.exponentialRampToValueAtTime(.001, now + duration);
+        source.connect(filter).connect(gain).connect(audioCompressor);
+        source.start(now);
+      }
+
+      function sound(type) {
+        if (muted || !initAudio()) return;
+        const pan = Math.max(-.7, Math.min(.7, (player.x / W - .5) * 1.4));
+        if (type === 'shoot') {
+          tone(920, 180, .075, .045, 'square', 0, pan);
+          tone(1320, 480, .045, .018, 'sine', .012, pan);
+          noise(.045, .016, 4200);
+        } else if (type === 'hit') {
+          tone(175, 48, .14, .07, 'sawtooth');
+          noise(.11, .065, 1150);
+        } else if (type === 'explode') {
+          tone(105, 30, .34, .105, 'sawtooth');
+          tone(62, 24, .4, .07, 'sine', .025);
+          noise(.32, .13, 820);
+        } else if (type === 'start') {
+          [220, 330, 440, 660].forEach((frequency, i) => tone(frequency, frequency * 1.02, .16, .035, 'triangle', i * .075));
+        } else if (type === 'level') {
+          [330, 440, 554, 880].forEach((frequency, i) => tone(frequency, frequency * 1.06, .28, .045, 'triangle', i * .09));
+          noise(.22, .025, 2600, .12);
+        } else if (type === 'pickup') {
+          [440, 660, 990].forEach((frequency, i) => tone(frequency, frequency * 1.08, .18, .035, 'sine', i * .055));
+        } else if (type === 'boss') {
+          tone(82, 42, .65, .12, 'sawtooth');
+          tone(164, 61, .55, .07, 'square', .16);
+          noise(.55, .09, 560);
+        } else if (type === 'gameover') {
+          [330, 247, 185, 110].forEach((frequency, i) => tone(frequency, frequency * .72, .34, .038, 'sawtooth', i * .13));
+          noise(.42, .045, 420, .24);
+        }
+      }
+
+      function musicPulse() {
+        if (muted || state !== 'playing' || !audioContext || !audioCompressor) return;
+        const roots = [110, 110, 123.47, 130.81, 146.83];
+        const root = roots[Math.min(4, Math.floor((level - 1) / 3))];
+        const scale = [1, 1.2, 1.5, 1.8, 2, 1.8, 1.5, 1.2];
+        const bossActive = enemies.some(enemy => enemy.type === 'boss');
+        if (musicStep % 4 === 0) tone(root / 2, root / 2, .22, bossActive ? .03 : .018, 'sine');
+        if (musicStep % 2 === 0) tone(root * scale[musicStep % scale.length], root * scale[musicStep % scale.length], .12, .012 + level * .0007, 'triangle', 0, musicStep % 4 === 0 ? -.25 : .25);
+        if (bossActive && musicStep % 4 === 2) noise(.045, .018, 1900);
+        musicStep = (musicStep + 1) % 32;
+      }
+
+      function startMusic() {
+        if (!initAudio()) return;
+        if (!musicTimer) musicTimer = setInterval(musicPulse, 235);
       }
 
       function shoot() {
@@ -405,12 +542,21 @@
           scout: { r: 18, hp: 1, speed: 145 + Math.random() * 35, points: 180 },
           heavy: { r: 27, hp: 3, speed: 65 + Math.random() * 22, points: 400 }
         };
-        const c = configs[type];
+        const c = { ...configs[type] };
+        const material = type === 'rock' ? themeForLevel().material : null;
+        if (material) {
+          const properties = ASTEROID_MATERIALS[material];
+          c.r *= properties.size;
+          c.hp += properties.hp;
+          c.speed *= properties.speed;
+          c.points = Math.round(c.points * properties.points / 10) * 10;
+        }
         enemies.push({
           type, x: QA_MODE ? W / 2 : c.r + 18 + Math.random() * (W - (c.r + 18) * 2), y: -c.r - 10,
           r: c.r, hp: c.hp, maxHp: c.hp, speed: c.speed * (1 + (level - 1) * .075),
           points: c.points, spin: Math.random() * Math.PI * 2, spinSpeed: (Math.random() - .5) * 1.7,
-          phase: Math.random() * Math.PI * 2
+          phase: Math.random() * Math.PI * 2, material,
+          surface: material ? createAsteroidSurface(c.r, material) : null
         });
       }
 
@@ -467,7 +613,9 @@
           localStorage.setItem('pixelDefenderHighScore', String(highScore));
         }
         const isBoss = enemy.type === 'boss';
-        const color = isBoss || enemy.type === 'heavy' ? COLORS.violet : COLORS.cyan;
+        const color = enemy.type === 'rock'
+          ? (ASTEROID_MATERIALS[enemy.material].glow || ASTEROID_MATERIALS[enemy.material].rim)
+          : isBoss || enemy.type === 'heavy' ? COLORS.violet : COLORS.cyan;
         burst(enemy.x, enemy.y, color, isBoss ? 55 : enemy.type === 'heavy' ? 28 : 17, isBoss ? 310 : 210);
         floater(enemy.x, enemy.y - 10, `+${earned}${multiplier > 1 ? `  x${multiplier}` : ''}`, multiplier > 1 ? COLORS.gold : COLORS.cyan);
         const dropChance = QA_MODE ? .42 : isBoss ? 1 : .13;
@@ -506,6 +654,7 @@
           highScore = Math.max(highScore, score);
           localStorage.setItem('pixelDefenderHighScore', String(highScore));
           setState('gameover');
+          sound('gameover');
         }
       }
 
@@ -522,11 +671,14 @@
 
       function update(dt) {
         elapsed += dt;
-        const levelDuration = QA_MODE ? 6 : 18;
-        const nextLevel = Math.min(12, 1 + Math.floor(elapsed / levelDuration));
+        const nextLevel = Math.min(12, 1 + Math.floor(elapsed / LEVEL_DURATION));
         if (nextLevel !== level) {
+          previousLevel = level;
           level = nextLevel;
-          floater(W / 2, H / 2 - 40, `SECTOR ${String(level).padStart(2, '0')}`, COLORS.gold);
+          levelBanner = 2.4;
+          spawnTimer = Math.max(spawnTimer, 1.25);
+          enemyBullets.length = 0;
+          musicStep = 0;
           sound('level');
         }
         const bossSector = QA_MODE ? level === 2 : level % 3 === 0;
@@ -544,6 +696,7 @@
         player.rapid = Math.max(0, player.rapid - dt);
         player.double = Math.max(0, player.double - dt);
         comboTimer = Math.max(0, comboTimer - dt);
+        levelBanner = Math.max(0, levelBanner - dt);
         if (comboTimer <= 0) combo = 0;
         if (keys.fire) shoot();
 
@@ -649,16 +802,17 @@
       }
 
       function drawBackground() {
+        const theme = themeForLevel();
         const gradient = ctx.createLinearGradient(0, 0, 0, H);
-        gradient.addColorStop(0, '#080d21');
-        gradient.addColorStop(.62, '#090d1b');
-        gradient.addColorStop(1, '#0d1020');
+        gradient.addColorStop(0, theme.bg[0]);
+        gradient.addColorStop(.62, theme.bg[1]);
+        gradient.addColorStop(1, theme.bg[2]);
         ctx.fillStyle = gradient;
         ctx.fillRect(0, 0, W, H);
 
         ctx.save();
         ctx.globalAlpha = .18;
-        ctx.strokeStyle = '#4c5e9b';
+        ctx.strokeStyle = theme.grid;
         ctx.lineWidth = 1;
         const horizon = 275;
         for (let y = horizon; y < H; y += 34) {
@@ -673,7 +827,7 @@
 
         for (const s of stars) {
           ctx.globalAlpha = .22 + s.z * .65;
-          ctx.fillStyle = s.z > .75 ? COLORS.cyan : '#d7deff';
+          ctx.fillStyle = s.z > .75 ? (ASTEROID_MATERIALS[theme.material].glow || COLORS.cyan) : theme.star;
           ctx.fillRect(s.x, s.y, s.size, s.size + s.z * 2.5);
         }
         ctx.globalAlpha = 1;
@@ -710,25 +864,105 @@
         ctx.restore();
       }
 
+      function traceAsteroid(asteroid) {
+        ctx.beginPath();
+        asteroid.surface.shape.forEach((variation, index, shape) => {
+          const angle = index / shape.length * Math.PI * 2;
+          const radius = asteroid.r * variation;
+          const x = Math.cos(angle) * radius;
+          const y = Math.sin(angle) * radius;
+          index ? ctx.lineTo(x, y) : ctx.moveTo(x, y);
+        });
+        ctx.closePath();
+      }
+
+      function drawAsteroid3D(asteroid) {
+        const material = ASTEROID_MATERIALS[asteroid.material] || ASTEROID_MATERIALS.rock;
+        const radius = asteroid.r;
+        ctx.save();
+        ctx.shadowColor = material.glow || 'rgba(0,0,0,.75)';
+        ctx.shadowBlur = material.glow ? 15 : 8;
+        traceAsteroid(asteroid);
+        const body = ctx.createRadialGradient(-radius * .38, -radius * .42, radius * .04, radius * .12, radius * .16, radius * 1.2);
+        body.addColorStop(0, material.light);
+        body.addColorStop(.36, material.base);
+        body.addColorStop(.78, material.dark);
+        body.addColorStop(1, '#080b12');
+        ctx.fillStyle = body;
+        ctx.fill();
+        ctx.clip();
+
+        const shade = ctx.createLinearGradient(-radius, -radius, radius, radius);
+        shade.addColorStop(0, 'rgba(255,255,255,.17)');
+        shade.addColorStop(.48, 'rgba(255,255,255,0)');
+        shade.addColorStop(1, 'rgba(0,0,0,.42)');
+        ctx.fillStyle = shade;
+        ctx.fillRect(-radius * 1.2, -radius * 1.2, radius * 2.4, radius * 2.4);
+
+        asteroid.surface.flecks.forEach(fleck => {
+          ctx.globalAlpha = fleck.alpha;
+          ctx.fillStyle = material.light;
+          ctx.beginPath(); ctx.arc(fleck.x, fleck.y, fleck.r, 0, Math.PI * 2); ctx.fill();
+        });
+        ctx.globalAlpha = 1;
+
+        asteroid.surface.craters.forEach(crater => {
+          const craterGradient = ctx.createRadialGradient(
+            crater.x - crater.r * .28, crater.y - crater.r * .32, crater.r * .08,
+            crater.x, crater.y, crater.r
+          );
+          craterGradient.addColorStop(0, material.dark);
+          craterGradient.addColorStop(.52, material.crater);
+          craterGradient.addColorStop(.76, material.base);
+          craterGradient.addColorStop(1, material.light);
+          ctx.fillStyle = craterGradient;
+          ctx.beginPath(); ctx.ellipse(crater.x, crater.y, crater.r, crater.r * .78, -.35, 0, Math.PI * 2); ctx.fill();
+          ctx.strokeStyle = 'rgba(0,0,0,.28)';
+          ctx.lineWidth = Math.max(1, radius * .035);
+          ctx.stroke();
+        });
+
+        if (asteroid.material === 'ice') {
+          ctx.strokeStyle = 'rgba(224,252,255,.52)';
+          ctx.lineWidth = 1.2;
+          asteroid.surface.flecks.slice(0, 5).forEach((fleck, i) => {
+            ctx.beginPath();
+            ctx.moveTo(fleck.x, fleck.y);
+            ctx.lineTo(fleck.x + Math.cos(i * 1.7) * radius * .42, fleck.y + Math.sin(i * 1.7) * radius * .42);
+            ctx.stroke();
+          });
+        }
+
+        if (asteroid.surface.cracks.length) {
+          ctx.strokeStyle = material.glow;
+          ctx.shadowColor = material.glow;
+          ctx.shadowBlur = 8;
+          ctx.lineWidth = Math.max(1.2, radius * .055);
+          asteroid.surface.cracks.forEach(crack => {
+            const startX = Math.cos(crack.angle) * radius * .12;
+            const startY = Math.sin(crack.angle) * radius * .12;
+            const midX = Math.cos(crack.angle + .2) * crack.length * .62;
+            const midY = Math.sin(crack.angle + .2) * crack.length * .62;
+            ctx.beginPath(); ctx.moveTo(startX, startY); ctx.lineTo(midX, midY);
+            ctx.lineTo(Math.cos(crack.angle) * crack.length, Math.sin(crack.angle) * crack.length); ctx.stroke();
+          });
+        }
+        ctx.restore();
+
+        traceAsteroid(asteroid);
+        ctx.strokeStyle = material.rim;
+        ctx.globalAlpha = .78;
+        ctx.lineWidth = Math.max(1.4, radius * .065);
+        ctx.stroke();
+        ctx.globalAlpha = 1;
+      }
+
       function drawEnemy(e) {
         ctx.save();
         ctx.translate(e.x, e.y);
         ctx.rotate(e.spin);
         if (e.type === 'rock') {
-          ctx.fillStyle = '#646d89';
-          ctx.strokeStyle = '#a2abc4';
-          ctx.lineWidth = 2;
-          ctx.beginPath();
-          const points = 9;
-          for (let i = 0; i < points; i++) {
-            const a = i / points * Math.PI * 2;
-            const r = e.r * (.76 + ((i * 7) % 5) * .055);
-            i ? ctx.lineTo(Math.cos(a) * r, Math.sin(a) * r) : ctx.moveTo(Math.cos(a) * r, Math.sin(a) * r);
-          }
-          ctx.closePath(); ctx.fill(); ctx.stroke();
-          ctx.fillStyle = '#3e4763';
-          ctx.beginPath(); ctx.arc(-e.r*.25, -e.r*.16, e.r*.22, 0, Math.PI*2); ctx.fill();
-          ctx.beginPath(); ctx.arc(e.r*.32, e.r*.22, e.r*.14, 0, Math.PI*2); ctx.fill();
+          drawAsteroid3D(e);
         } else if (e.type === 'scout') {
           ctx.shadowColor = COLORS.pink; ctx.shadowBlur = 14;
           ctx.fillStyle = '#ff5c93';
@@ -761,7 +995,8 @@
         if (e.maxHp > 1 && e.type !== 'boss') {
           const w = e.r * 1.45;
           ctx.fillStyle = 'rgba(0,0,0,.5)'; ctx.fillRect(e.x - w/2, e.y + e.r + 8, w, 4);
-          ctx.fillStyle = COLORS.violet; ctx.fillRect(e.x - w/2, e.y + e.r + 8, w * (e.hp/e.maxHp), 4);
+          ctx.fillStyle = e.type === 'rock' ? (ASTEROID_MATERIALS[e.material].glow || ASTEROID_MATERIALS[e.material].rim) : COLORS.violet;
+          ctx.fillRect(e.x - w/2, e.y + e.r + 8, w * (e.hp/e.maxHp), 4);
         }
       }
 
@@ -838,13 +1073,18 @@
       }
 
       function drawHud() {
+        const theme = themeForLevel();
         ctx.fillStyle = 'rgba(7,11,24,.68)';
         ctx.fillRect(0, 0, W, 58);
         ctx.strokeStyle = 'rgba(102,163,220,.17)';
         ctx.beginPath(); ctx.moveTo(0, 58.5); ctx.lineTo(W, 58.5); ctx.stroke();
         text('SCORE', 26, 18, 9, COLORS.muted, 'left', 800);
         text(String(score).padStart(6, '0'), 26, 39, 19, COLORS.ink);
-        text(`SECTOR ${String(level).padStart(2, '0')}`, W/2, 31, 12, COLORS.cyan, 'center', 800);
+        text(theme.name, W/2, 16, 7, theme.star, 'center', 800);
+        text(`SECTOR ${String(level).padStart(2, '0')}`, W/2, 35, 12, COLORS.cyan, 'center', 800);
+        const levelProgress = level === 12 ? 1 : Math.min(1, Math.max(0, (elapsed - (level - 1) * LEVEL_DURATION) / LEVEL_DURATION));
+        ctx.fillStyle = 'rgba(84,244,255,.12)'; ctx.fillRect(W/2 - 72, 51, 144, 2);
+        ctx.fillStyle = COLORS.cyan; ctx.fillRect(W/2 - 72, 51, 144 * levelProgress, 2);
         text('BEST', W - 150, 18, 9, COLORS.muted, 'left', 800);
         text(String(highScore).padStart(6, '0'), W - 150, 39, 17, COLORS.ink);
         text('HULL', W - 26, 18, 9, COLORS.muted, 'right', 800);
@@ -882,6 +1122,26 @@
         }
       }
 
+      function drawLevelTransition() {
+        if (levelBanner <= 0 || state !== 'playing') return;
+        const theme = themeForLevel();
+        const fadeIn = Math.min(1, (2.4 - levelBanner) * 3.2);
+        const fadeOut = Math.min(1, levelBanner * 1.35);
+        const alpha = Math.min(fadeIn, fadeOut);
+        ctx.save();
+        ctx.globalAlpha = alpha;
+        ctx.fillStyle = 'rgba(4,7,17,.76)';
+        ctx.fillRect(0, H / 2 - 78, W, 156);
+        ctx.strokeStyle = ASTEROID_MATERIALS[theme.material].glow || theme.star;
+        ctx.lineWidth = 1;
+        ctx.beginPath(); ctx.moveTo(0, H/2 - 78); ctx.lineTo(W, H/2 - 78); ctx.moveTo(0, H/2 + 78); ctx.lineTo(W, H/2 + 78); ctx.stroke();
+        text('LEVEL UPGRADE', W/2, H/2 - 42, 10, COLORS.gold, 'center', 900);
+        text(`SECTOR ${String(level).padStart(2, '0')}`, W/2, H/2 - 2, 32, COLORS.ink, 'center', 900);
+        text(`${theme.name}  //  ${ASTEROID_MATERIALS[theme.material].label} ASTEROIDS`, W/2, H/2 + 38, 11, theme.star, 'center', 800);
+        text(`Threat increased from sector ${String(previousLevel).padStart(2, '0')}`, W/2, H/2 + 61, 8, COLORS.muted, 'center', 700);
+        ctx.restore();
+      }
+
       function panel(title, subtitle, action, accent = COLORS.cyan) {
         ctx.fillStyle = 'rgba(4,7,17,.70)'; ctx.fillRect(0, 0, W, H);
         const pw = 500, ph = 260, px = (W-pw)/2, py = (H-ph)/2;
@@ -909,6 +1169,8 @@
         drawEffects();
         drawHud();
         ctx.restore();
+
+        drawLevelTransition();
 
         if (state === 'start') {
           panel('PIXEL DEFENDER', 'Protect the sector. Break the high score.', 'PRESS SPACE TO DEPLOY');
@@ -960,6 +1222,8 @@
 
       function toggleMute() {
         muted = !muted;
+        if (masterGain && audioContext) masterGain.gain.setTargetAtTime(muted ? 0 : .72, audioContext.currentTime, .025);
+        if (!muted) startMusic();
         soundButton.innerHTML = muted ? '&#10005;' : '&#9835;';
         soundButton.setAttribute('aria-label', muted ? 'Unmute sound' : 'Mute sound');
       }
@@ -1009,8 +1273,15 @@
 
       function publishQASnapshot() {
         if (!QA_MODE) return;
+        const levelProgress = level === 12 ? 1 : Math.min(1, Math.max(0, (elapsed - (level - 1) * LEVEL_DURATION) / LEVEL_DURATION));
         const snapshot = {
           state, score, level, lives, combo, maxCombo,
+          theme: themeForLevel().name,
+          expectedAsteroidMaterial: themeForLevel().material,
+          asteroidMaterials: [...new Set(enemies.filter(enemy => enemy.type === 'rock').map(enemy => enemy.material))],
+          levelBanner: Number(levelBanner.toFixed(2)),
+          levelProgress: Number(levelProgress.toFixed(2)),
+          audioReady: Boolean(audioContext && masterGain && audioCompressor && musicTimer),
           activePowerUps: {
             shield: Number(player.shield.toFixed(2)),
             rapid: Number(player.rapid.toFixed(2)),
